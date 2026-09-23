@@ -274,6 +274,12 @@ AUTOMATION_PROFILE = Path(
 # and Chrome refuses to share the port (our instance would end up IPv6-only and
 # unreachable at 127.0.0.1:9222, which answers 404 from the other instance).
 AUTOMATION_PORT = 9223
+# Chrome no longer writes DevToolsActivePort into a custom --user-data-dir, so
+# the port we picked is persisted here to be rediscovered after a daemon restart.
+AUTOMATION_PORT_FILE = Path(
+    os.environ.get("BH_AUTOMATION_PORT_FILE")
+    or (Path.home() / ".config" / "browser-harness" / "automation-port")
+)
 
 
 def _json_version_ws(port):
@@ -318,17 +324,36 @@ def _free_port():
         return s.getsockname()[1]
 
 
+def _remembered_port():
+    try:
+        port = int(AUTOMATION_PORT_FILE.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+    return port if 0 < port < 65536 else None
+
+
+def _remember_port(port):
+    try:
+        AUTOMATION_PORT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        AUTOMATION_PORT_FILE.write_text(str(port), encoding="utf-8")
+    except OSError:
+        pass
+
+
 def launch_automation_chrome():
     """Launch (or reuse) a dedicated automation browser; return its WS URL.
 
     Only used as a fallback when the default profile is unreadable (macOS TCC)
     or no debuggable browser is running."""
-    if ws := _json_version_ws(AUTOMATION_PORT):
-        return ws
+    candidates = [p for p in (_remembered_port(), AUTOMATION_PORT) if p]
+    for port in candidates:
+        if ws := _json_version_ws(port):
+            return ws
     binary = _automation_chrome_binary()
     if not binary:
         return None
-    port = AUTOMATION_PORT if not _port_in_use(AUTOMATION_PORT) else _free_port()
+    port = next((p for p in candidates if not _port_in_use(p)), None) or _free_port()
+    _remember_port(port)
     try:
         AUTOMATION_PROFILE.mkdir(parents=True, exist_ok=True)
         subprocess.Popen(
@@ -384,18 +409,19 @@ def get_ws_url():
     next_liveness_check = 0.0
     blocked = False
     while time.time() < deadline:
+        readable = False
+        denied = False
         for base in PROFILES:
             try:
                 active = (base / "DevToolsActivePort").read_text(encoding="utf-8", errors="replace").splitlines()
-            except FileNotFoundError:
-                continue
             except PermissionError:
-                # macOS TCC blocks the browser profile dir; no file here is
-                # readable, so fall back to a dedicated automation Chrome below.
-                blocked = True
+                # macOS TCC blocks this profile dir (EPERM) — try the others.
+                denied = True
                 continue
             except OSError:
+                # Missing file or dir: no debuggable browser here.
                 continue
+            readable = True
             port = active[0].strip() if active else ""
             ws_path = active[1].strip() if len(active) > 1 else ""
             if not port:
@@ -418,7 +444,11 @@ def get_ws_url():
         # Closed browser leaves stale DevToolsActivePort files
         now = time.time()
         if now >= next_liveness_check:
-            if blocked:
+            if denied and not readable:
+                # No profile's DevToolsActivePort was readable and at least one
+                # was permission-denied (macOS TCC) — normal discovery can't
+                # work, so take the automation fallback.
+                blocked = True
                 break
             if not supported_browser_running():
                 raise RuntimeError(
@@ -441,13 +471,12 @@ def get_ws_url():
             continue
     if blocked:
         # No profile was readable (macOS TCC) and nothing answered on the probe
-        # ports — launch a dedicated automation Chrome so the harness still works.
+        # ports — launch a dedicated automation Chrome so the harness keeps working.
         if ws := launch_automation_chrome():
             return ws
+        raise RuntimeError("macOS blocked reading the browser profile dir (needs Full Disk Access). Grant the host app (Terminal, editor, ...) Full Disk Access in System Settings → Privacy & Security, or run a dedicated automation Chrome and set BU_CDP_URL")
     if remote_debugging_user_enabled() is False:
         raise RuntimeError('remote debugging is turned off for this browser instance — enable chrome://inspect/#remote-debugging (tick "Allow remote debugging for this browser instance")')
-    if blocked:
-        raise RuntimeError("macOS blocked reading the browser profile dir (needs Full Disk Access). Grant Terminal Full Disk Access in System Settings → Privacy & Security, or run a dedicated automation Chrome and set BU_CDP_URL")
     raise RuntimeError(f"DevToolsActivePort not found in {[str(p) for p in PROFILES]} — enable chrome://inspect/#remote-debugging, or set BU_CDP_WS for a remote browser")
 
 
